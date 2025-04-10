@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import warnings
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from random import choice
 from types import TracebackType
-from typing import Any, Literal
+from typing import Any, Literal, Optional, Union
 
 import primp
 
@@ -63,6 +64,7 @@ class DuckAI:
         duckai_proxy: str | None = os.environ.get("DUCKAI_PROXY")
         self.proxy: str | None = duckai_proxy if duckai_proxy else _expand_proxy_tb_alias(proxy)
         self.timeout = timeout
+        self.verify = verify
         self.client = primp.Client(
             proxy=self.proxy,
             timeout=self.timeout,
@@ -78,8 +80,18 @@ class DuckAI:
         self._chat_vqd: str = ""
         self._chat_vqd_hash: str = ""
         self.sleep_timestamp = 0.0
+        
+        # Async client
+        self.async_client = None
 
     def __enter__(self) -> DuckAI:
+        return self
+    
+    async def __aenter__(self) -> 'DuckAI':
+        """Async context manager entry."""
+        if self.async_client is None:
+            # Initialize async client when needed
+            self.async_client = await self._create_async_client()
         return self
 
     def __exit__(
@@ -89,6 +101,31 @@ class DuckAI:
         exc_tb: TracebackType | None = None,
     ) -> None:
         pass
+    
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_val: BaseException | None = None,
+        exc_tb: TracebackType | None = None,
+    ) -> None:
+        """Async context manager exit."""
+        if self.async_client is not None:
+            await self.async_client.__aexit__()
+            self.async_client = None
+
+    async def _create_async_client(self) -> primp.AsyncClient:
+        """Create an async HTTP client with similar settings to the sync client."""
+        # Using primp's AsyncClient with the same settings as the sync client
+        return primp.AsyncClient(
+            proxy=self.proxy,
+            timeout=self.timeout,
+            cookie_store=True,
+            referer=True,
+            impersonate=choice(self._impersonates),  # type: ignore
+            impersonate_os=choice(self._impersonates_os),  # type: ignore
+            follow_redirects=False,
+            verify=self.verify,
+        )
 
     def _get_url(
         self,
@@ -119,6 +156,46 @@ class DuckAI:
                 raise TimeoutException(f"{url} {type(ex).__name__}: {ex}") from ex
             raise DuckAIException(f"{url} {type(ex).__name__}: {ex}") from ex
         logger.debug(f"_get_url() {resp.url} {resp.status_code}")
+        if resp.status_code == 200:
+            return resp
+        elif resp.status_code in (202, 301, 403, 400, 429, 418):
+            raise RatelimitException(f"{resp.url} {resp.status_code} Ratelimit")
+        raise DuckAIException(f"{resp.url} return None. {params=} {content=} {data=}")
+
+    async def _get_url_async(
+        self,
+        method: Literal["GET", "HEAD", "OPTIONS", "DELETE", "POST", "PUT", "PATCH"],
+        url: str,
+        params: dict[str, str] | None = None,
+        content: bytes | None = None,
+        data: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        json: Any = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """Async version of _get_url."""
+        if self.async_client is None:
+            self.async_client = await self._create_async_client()
+            
+        try:
+            resp = await self.async_client.request(
+                method,
+                url,
+                params=params,
+                content=content,
+                data=data,
+                headers=headers,
+                cookies=cookies,
+                json=json,
+                timeout=timeout or self.timeout,
+            )
+        except Exception as ex:
+            if "time" in str(ex).lower():
+                raise TimeoutException(f"{url} {type(ex).__name__}: {ex}") from ex
+            raise DuckAIException(f"{url} {type(ex).__name__}: {ex}") from ex
+        
+        logger.debug(f"_get_url_async() {resp.url} {resp.status_code}")
         if resp.status_code == 200:
             return resp
         elif resp.status_code in (202, 301, 403, 400, 429, 418):
@@ -227,3 +304,133 @@ class DuckAI:
         """
         answer_generator = self.chat_yield(keywords, model, timeout)
         return "".join(answer_generator)
+    
+    async def _initialize_async_session(self) -> None:
+        """Initialize async session parameters (vqd, xfe, etc.)."""
+        # x-fe-version
+        if not DuckAI._chat_xfe:
+            resp = await self._get_url_async(
+                method="GET",
+                url="https://duckduckgo.com/?q=DuckDuckGo+AI+Chat&ia=chat&duckai=1",
+            )
+            resp_content = resp.content
+            try:
+                xfe1 = resp_content.split(b'__DDG_BE_VERSION__="', maxsplit=1)[1].split(b'"', maxsplit=1)[0].decode()
+                xfe2 = resp_content.split(b'__DDG_FE_CHAT_HASH__="', maxsplit=1)[1].split(b'"', maxsplit=1)[0].decode()
+                DuckAI._chat_xfe = f"{xfe1}-{xfe2}"
+            except Exception as ex:
+                raise DuckAIException(f"_initialize_async_session() Error to get _chat_xfe: {type(ex).__name__}: {ex}") from ex
+        
+        # vqd
+        if not self._chat_vqd:
+            resp = await self._get_url_async(
+                method="GET", url="https://duckduckgo.com/duckchat/v1/status", headers={"x-vqd-accept": "1"}
+            )
+            self._chat_vqd = resp.headers.get("x-vqd-4", "")
+            self._chat_vqd_hash = resp.headers.get("x-vqd-hash-1", "")
+            
+        # When using the async client, we need to adapt the hash calculation
+        # This assumes build_x_vqd_hash_1 works with a dict of headers
+        if self.async_client:
+            self._chat_vqd_hash = build_x_vqd_hash_1(self._chat_vqd_hash, dict(self.async_client.headers))
+    
+    async def chat_yield_async(self, keywords: str, model: str = "gpt-4o-mini", timeout: float = 30) -> AsyncIterator[str]:
+        """Async version of chat_yield that initiates a chat session with DuckDuckGo AI.
+
+        Args:
+            keywords (str): The initial message or question to send to the AI.
+            model (str): The model to use: "gpt-4o-mini", "llama-3.3-70b", "claude-3-haiku",
+                "o3-mini", "mistral-small-3". Defaults to "gpt-4o-mini".
+            timeout (int): Timeout value for the HTTP client. Defaults to 30.
+
+        Yields:
+            str: Chunks of the response from the AI.
+        """
+        # Initialize async client if needed
+        if self.async_client is None:
+            self.async_client = await self._create_async_client()
+            
+        # Initialize session parameters
+        await self._initialize_async_session()
+        
+        self._chat_messages.append({"role": "user", "content": keywords})
+        self._chat_tokens_count += max(len(keywords) // 4, 1)  # approximate number of tokens
+        
+        if model not in self._chat_models:
+            warnings.warn(f"{model=} is unavailable. Using 'gpt-4o-mini'", stacklevel=1)
+            model = "gpt-4o-mini"
+            
+        json_data = {
+            "model": self._chat_models[model],
+            "messages": self._chat_messages,
+        }
+        
+        resp = await self._get_url_async(
+            method="POST",
+            url="https://duckduckgo.com/duckchat/v1/chat",
+            headers={
+                "x-fe-version": DuckAI._chat_xfe,
+                "x-vqd-4": self._chat_vqd,
+                "x-vqd-hash-1": self._chat_vqd_hash,
+            },
+            json=json_data,
+            timeout=timeout,
+        )
+        
+        self._chat_vqd = resp.headers.get("x-vqd-4", "")
+        self._chat_vqd_hash = resp.headers.get("x-vqd-hash-1", "")
+        
+        chunks = []
+        try:
+            async for chunk in resp.astream():
+                lines = chunk.split(b"data:")
+                for line in lines:
+                    if line := line.strip():
+                        if line == b"[DONE]":
+                            break
+                        if line == b"[DONE][LIMIT_CONVERSATION]":
+                            raise ConversationLimitException("ERR_CONVERSATION_LIMIT")
+                        try:
+                            x = json_loads(line)
+                            if isinstance(x, dict):
+                                if x.get("action") == "error":
+                                    err_message = x.get("type", "")
+                                    if x.get("status") == 429:
+                                        raise (
+                                            ConversationLimitException(err_message)
+                                            if err_message == "ERR_CONVERSATION_LIMIT"
+                                            else RatelimitException(err_message)
+                                        )
+                                    raise DuckAIException(err_message)
+                                elif message := x.get("message"):
+                                    chunks.append(message)
+                                    yield message
+                        except Exception as ex:
+                            # Skip malformed JSON
+                            if not isinstance(ex, (ConversationLimitException, RatelimitException, DuckAIException)):
+                                logger.warning(f"Failed to parse chunk: {line} - {type(ex).__name__}: {ex}")
+                                continue
+                            raise
+        except Exception as ex:
+            raise DuckAIException(f"chat_yield_async() {type(ex).__name__}: {ex}") from ex
+
+        result = "".join(chunks)
+        self._chat_messages.append({"role": "assistant", "content": result})
+        self._chat_tokens_count += len(result)
+    
+    async def chat_async(self, keywords: str, model: str = "gpt-4o-mini", timeout: int = 30) -> str:
+        """Async version of chat that initiates a chat session with DuckDuckGo AI.
+
+        Args:
+            keywords (str): The initial message or question to send to the AI.
+            model (str): The model to use: "gpt-4o-mini", "llama-3.3-70b", "claude-3-haiku",
+                "o3-mini", "mistral-small-3". Defaults to "gpt-4o-mini".
+            timeout (int): Timeout value for the HTTP client. Defaults to 30.
+
+        Returns:
+            str: The response from the AI.
+        """
+        chunks = []
+        async for chunk in self.chat_yield_async(keywords, model, timeout):
+            chunks.append(chunk)
+        return "".join(chunks)
